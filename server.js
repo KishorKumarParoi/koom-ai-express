@@ -45,13 +45,17 @@ io.on("connection", (socket) => {
 
     socket.on('video-chunks', async (data) => {
         console.log("🟢 Video Chunk is sent", data);
+
         const writeStream = fs.createWriteStream('temp_upload/' + data.filename)
         recordedChunks.push(data.chunks)
+
         const videoBlob = new Blob(recordedChunks, {
             type: 'video/webm; codecs=vp9'
         })
+
         const buffer = Buffer.from(await videoBlob.arrayBuffer())
         const readStream = Readable.from(buffer)
+
         readStream.pipe(writeStream).on('finish', () => {
             console.log("🟢 Chunk Saved");
         })
@@ -67,7 +71,7 @@ io.on("connection", (socket) => {
             )
 
             if (processing.data.status !== 200) {
-                console.log(
+                return console.log(
                     'Error:🔴 Something went wrong with creating processing file!'
                 )
             }
@@ -111,7 +115,7 @@ io.on("connection", (socket) => {
                                         ]
                                     })
 
-                                    const titleAndSummaryGenerated = await axios.post(`${process.env.NEXT_API_HOST}/recording/${data.userId / transcribe}`, {
+                                    const titleAndSummaryGenerated = await axios.post(`${process.env.NEXT_API_HOST}/recording/${data.userId}/transcribe`, {
                                         filename: data.filename,
                                         content: completion.choices[0].message.content,
                                         transcript: transcription
@@ -138,6 +142,14 @@ io.on("connection", (socket) => {
                         'Error:🔴 Something went wrong when stopping the process and trying to complete the processing stage!'
                     )
                 }
+
+                if (stopProcessing.status === 200) {
+                    fs.unlink('temp_upload/' + data.filename, (err) => {
+                        if (!err) console.log(data.filename + ' ' + '🟢 deleted successfully!');
+                    })
+                }
+            } else {
+                console.log("🔴 Error, Upload Failes! process aborted!");
             }
         })
     })
