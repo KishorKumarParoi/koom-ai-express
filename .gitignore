@@ -20,7 +20,7 @@ Thumbs.db
 dist/
 build/
 out/
-
+temp_upload
 # Temporary files
 temp/
 tmp/
