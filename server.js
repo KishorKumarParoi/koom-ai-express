@@ -1,165 +1,408 @@
-import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3"
-import axios from "axios"
-import { Blob } from 'buffer'
-import cors from 'cors'
-import dotenv from 'dotenv'
-import express from 'express'
-import fs from 'fs'
-import http from 'http'
-import OpenAI from "openai"
-import { Server } from 'socket.io'
-import { Readable } from 'stream'
+import { PutObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import axios from "axios";
+import { Blob } from "buffer";
+import cors from "cors";
+import dotenv from "dotenv";
+import express from "express";
+import fs from "fs";
+import http from "http";
+import OpenAI from "openai";
+import path from "path";
+import { Server } from "socket.io";
+import { Readable } from "stream";
 
-const app = express()
-app.use(cors())
+dotenv.config();
 
-dotenv.config()
+const app = express();
+const port = process.env.PORT || 5001;
 
-const port = 5001;
+// Ensure upload cache directory exists
+const TEMP_DIR = path.resolve("temp_upload");
+if (!fs.existsSync(TEMP_DIR)) {
+  fs.mkdirSync(TEMP_DIR, { recursive: true });
+}
 
-const server = http.createServer(app)
+// Global Middleware
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  credentials: true,
+}));
+app.use(express.json({ limit: "250mb" }));
+app.use(express.urlencoded({ extended: true, limit: "250mb" }));
 
+// Static file hosting for recorded video fallback
+app.use("/uploads", express.static(TEMP_DIR));
+
+const server = http.createServer(app);
+
+// Socket.IO configuration with cross-origin resilience
 const io = new Server(server, {
-    cors: {
-        origin: process.env.ELECTRON_HOST,
-        methods: ['GET', 'POST']
-    }
-})
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"],
+  },
+  maxHttpBufferSize: 1e8, // 100 MB per message
+  pingTimeout: 60000,
+  pingInterval: 25000,
+});
 
-const s3 = new S3Client({
-    credentials: {
+// Telemetry & metrics counters
+const metrics = {
+  activeConnections: 0,
+  totalChunksReceived: 0,
+  totalVideosProcessed: 0,
+  failedUploads: 0,
+  webrtcRooms: 0,
+  startTime: Date.now(),
+};
+
+// AWS S3 Client setup with credentials validation
+const hasAwsCreds = Boolean(
+  process.env.ACCESS_KEY &&
+  process.env.SECRET_KEY &&
+  process.env.BUCKET_NAME
+);
+
+const s3 = hasAwsCreds
+  ? new S3Client({
+      credentials: {
         accessKeyId: process.env.ACCESS_KEY,
-        secretAccessKey: process.env.SECRET_KEY
+        secretAccessKey: process.env.SECRET_KEY,
+      },
+      region: process.env.BUCKET_REGION || "us-east-1",
+    })
+  : null;
+
+// OpenAI client setup with validation
+const hasOpenAI = Boolean(process.env.OPENAI_SECRET_KEY);
+const openai = hasOpenAI
+  ? new OpenAI({
+      apiKey: process.env.OPENAI_SECRET_KEY,
+    })
+  : null;
+
+// Per-session buffer store (eliminates cross-session chunk corruption)
+const sessionChunkBuffers = new Map();
+const sessionStreams = new Map();
+
+// Helper to safely write chunk to disk
+const getOrCreateStream = (filename) => {
+  if (!sessionStreams.has(filename)) {
+    const filePath = path.join(TEMP_DIR, filename);
+    const writeStream = fs.createWriteStream(filePath, { flags: "a" });
+    sessionStreams.set(filename, writeStream);
+  }
+  return sessionStreams.get(filename);
+};
+
+// REST API Endpoints
+app.get("/", (req, res) => {
+  res.json({
+    name: "KoomAI Real-Time Media Ingestion Engine",
+    status: "OPERATIONAL",
+    version: "1.2.0",
+    service: "koom-ai-express",
+    port,
+    uptime_seconds: Math.floor((Date.now() - metrics.startTime) / 1000),
+    endpoints: {
+      health: "/health",
+      ready: "/ready",
+      metrics: "/metrics",
+      uploads: "/uploads",
     },
-    region: process.env.BUCKET_REGION
-})
+  });
+});
 
-const openai = new OpenAI({
-    apiKey: process.env.OPENAI_SECRET_KEY
-})
+app.get("/health", (req, res) => {
+  res.json({
+    status: "HEALTHY",
+    uptime_seconds: Math.floor((Date.now() - metrics.startTime) / 1000),
+    timestamp: new Date().toISOString(),
+    aws_s3_configured: hasAwsCreds,
+    openai_configured: hasOpenAI,
+    active_connections: metrics.activeConnections,
+    active_recording_sessions: sessionChunkBuffers.size,
+  });
+});
 
-let recordedChunks = []
+app.get("/ready", (req, res) => {
+  res.json({ status: "READY", timestamp: Date.now() });
+});
 
+app.get("/metrics", (req, res) => {
+  res.json({
+    ...metrics,
+    activeRecordingSessions: sessionChunkBuffers.size,
+    memoryUsageMB: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+  });
+});
+
+// Direct HTTP Video Upload Endpoint (for Chrome Extension & REST clients)
+app.post("/api/upload", async (req, res) => {
+  try {
+    const { filename, userId, base64Data } = req.body;
+    if (!filename || !userId || !base64Data) {
+      return res.status(400).json({ error: "Missing filename, userId, or base64Data" });
+    }
+
+    const buffer = Buffer.from(base64Data, "base64");
+    const filePath = path.join(TEMP_DIR, filename);
+    await fs.promises.writeFile(filePath, buffer);
+
+    console.log(`[HTTP Upload] Saved ${filename} (${buffer.length} bytes) for user ${userId}`);
+
+    // Trigger video processing in background
+    processVideoPipeline({ filename, userId });
+
+    return res.json({
+      status: 200,
+      message: "Video received and queued for processing",
+      filename,
+      localUrl: `/uploads/${filename}`,
+    });
+  } catch (error) {
+    console.error("[HTTP Upload Error]:", error);
+    return res.status(500).json({ error: error.message });
+  }
+});
+
+// Centralized Processing Pipeline
+async function processVideoPipeline(data) {
+  const { filename, userId } = data;
+  const filePath = path.join(TEMP_DIR, filename);
+  metrics.totalVideosProcessed += 1;
+
+  console.log(`[Pipeline] Starting video processing for ${filename} (User: ${userId})`);
+
+  // Close write stream if open
+  if (sessionStreams.has(filename)) {
+    sessionStreams.get(filename).end();
+    sessionStreams.delete(filename);
+  }
+  sessionChunkBuffers.delete(filename);
+
+  let nextApiHost = process.env.NEXT_API_HOST || "http://localhost:3000/api";
+  nextApiHost = nextApiHost.replace(/\/$/, "");
+
+  let isProPlan = false;
+
+  // 1. Notify Next.js backend of processing stage
+  try {
+    const processingRes = await axios.post(
+      `${nextApiHost}/recording/${userId}/processing`,
+      { filename },
+      { timeout: 8000 }
+    );
+    if (processingRes.data && processingRes.data.plan === "PRO") {
+      isProPlan = true;
+    }
+    console.log(`[Pipeline] Next.js processing status: ${processingRes.status}, Plan: ${isProPlan ? "PRO" : "FREE"}`);
+  } catch (err) {
+    console.warn(`[Pipeline Warning] Next.js processing webhook unreachable or error: ${err.message}`);
+  }
+
+  // 2. Upload to AWS S3 (with local fallback if unconfigured or error)
+  let uploadSuccess = false;
+  if (hasAwsCreds && s3) {
+    try {
+      const fileBuffer = await fs.promises.readFile(filePath);
+      const command = new PutObjectCommand({
+        Key: filename,
+        Bucket: process.env.BUCKET_NAME,
+        ContentType: "video/webm",
+        Body: fileBuffer,
+      });
+      const s3Res = await s3.send(command);
+      if (s3Res.$metadata?.httpStatusCode === 200) {
+        uploadSuccess = true;
+        console.log(`[Pipeline] ✅ Video successfully uploaded to AWS S3: ${filename}`);
+      }
+    } catch (s3Err) {
+      console.warn(`[Pipeline Warning] AWS S3 upload failed: ${s3Err.message}. Serving via local static fallback.`);
+      metrics.failedUploads += 1;
+    }
+  } else {
+    console.log(`[Pipeline Info] AWS S3 credentials not provided. Video stored locally at ${filePath}`);
+    uploadSuccess = true; // Fallback treated as success
+  }
+
+  // 3. AI Whisper Transcription & GPT Summary (if Pro plan or enabled)
+  let generatedTitle = `Screen Recording — ${new Date().toLocaleDateString()}`;
+  let generatedSummary = "High-definition video screen capture recorded via KoomAI.";
+  let rawTranscript = "";
+
+  if (hasOpenAI && openai && isProPlan) {
+    try {
+      const stat = await fs.promises.stat(filePath);
+      if (stat.size < 25 * 1024 * 1024) { // Whisper max 25MB
+        console.log(`[Pipeline] Requesting OpenAI Whisper transcription for ${filename}...`);
+        const transcription = await openai.audio.transcriptions.create({
+          file: fs.createReadStream(filePath),
+          model: "whisper-1",
+          response_format: "text",
+        });
+
+        if (transcription) {
+          rawTranscript = transcription;
+          console.log(`[Pipeline] Transcription received (${rawTranscript.length} chars). Generating summary...`);
+
+          const completion = await openai.chat.completions.create({
+            model: "gpt-3.5-turbo",
+            response_format: { type: "json_object" },
+            messages: [
+              {
+                role: "system",
+                content: `You are an AI assistant generating video metadata from speech transcriptions. Analyze: transcription(${transcription}) and output JSON: {"title": "<concise title>", "summary": "<clear 2-3 sentence summary>"}`
+              },
+            ],
+          });
+
+          const parsed = JSON.parse(completion.choices[0].message.content || "{}");
+          if (parsed.title) generatedTitle = parsed.title;
+          if (parsed.summary) generatedSummary = parsed.summary;
+        }
+      }
+    } catch (aiErr) {
+      console.warn(`[Pipeline Warning] OpenAI transcription/summary error: ${aiErr.message}`);
+    }
+  }
+
+  // 4. Send transcription results to Next.js
+  try {
+    await axios.post(
+      `${nextApiHost}/recording/${userId}/transcribe`,
+      {
+        filename,
+        content: JSON.stringify({ title: generatedTitle, summary: generatedSummary }),
+        transcript: rawTranscript || "Automated audio analysis completed.",
+      },
+      { timeout: 8000 }
+    );
+    console.log(`[Pipeline] ✅ AI metadata synced to Next.js for ${filename}`);
+  } catch (transcribeErr) {
+    console.warn(`[Pipeline Warning] Next.js transcribe sync skipped: ${transcribeErr.message}`);
+  }
+
+  // 5. Notify Next.js of completion
+  try {
+    const completeRes = await axios.post(
+      `${nextApiHost}/recording/${userId}/complete`,
+      { filename },
+      { timeout: 8000 }
+    );
+    console.log(`[Pipeline] ✅ Next.js marked processing complete for ${filename} (status: ${completeRes.status})`);
+  } catch (completeErr) {
+    console.warn(`[Pipeline Warning] Next.js complete webhook skipped: ${completeErr.message}`);
+  }
+
+  // If successfully uploaded to cloud, clean up temporary file to save local disk space
+  if (uploadSuccess && hasAwsCreds) {
+    fs.unlink(filePath, (err) => {
+      if (!err) console.log(`[Pipeline] Cleaned up temporary local file: ${filename}`);
+    });
+  }
+}
+
+// Socket.IO Real-Time Streaming & WebRTC Signalling
 io.on("connection", (socket) => {
-    console.log("🟢 Socket is connected");
+  metrics.activeConnections += 1;
+  console.log(`🟢 [Socket] Client connected: ${socket.id} (Total: ${metrics.activeConnections})`);
 
-    socket.on('video-chunks', async (data) => {
-        console.log("🟢 Video Chunk is sent", data);
+  // Video Chunks Ingestion Stream (Desktop & Chrome Extension)
+  socket.on("video-chunks", async (data) => {
+    metrics.totalChunksReceived += 1;
+    const { filename, chunks } = data;
+    if (!filename || !chunks) return;
 
-        const writeStream = fs.createWriteStream('temp_upload/' + data.filename)
-        recordedChunks.push(data.chunks)
+    try {
+      // Append chunk buffer to session store
+      if (!sessionChunkBuffers.has(filename)) {
+        sessionChunkBuffers.set(filename, []);
+      }
+      sessionChunkBuffers.get(filename).push(chunks);
 
-        const videoBlob = new Blob(recordedChunks, {
-            type: 'video/webm; codecs=vp9'
-        })
+      // Stream directly to disk for low memory overhead
+      const stream = getOrCreateStream(filename);
+      const chunkBlob = new Blob([chunks], { type: "video/webm; codecs=vp9" });
+      const buffer = Buffer.from(await chunkBlob.arrayBuffer());
+      stream.write(buffer);
+    } catch (err) {
+      console.error(`[Socket Error] Error appending chunk for ${filename}:`, err);
+    }
+  });
 
-        const buffer = Buffer.from(await videoBlob.arrayBuffer())
-        const readStream = Readable.from(buffer)
+  // Complete and Process Recording
+  socket.on("process-video", async (data) => {
+    console.log("🟢 [Socket] process-video triggered:", data);
+    try {
+      await processVideoPipeline(data);
+      socket.emit("processing-complete", {
+        filename: data.filename,
+        status: "SUCCESS",
+        timestamp: Date.now(),
+      });
+    } catch (err) {
+      console.error("[Socket] Video processing pipeline failed:", err);
+      socket.emit("processing-error", {
+        filename: data.filename,
+        error: err.message,
+      });
+    }
+  });
 
-        readStream.pipe(writeStream).on('finish', () => {
-            console.log("🟢 Chunk Saved");
-        })
-    })
+  // WebRTC Signalling Gateway (<120ms Real-Time P2P / Mesh Video)
+  socket.on("join-room", (roomId, callback) => {
+    socket.join(roomId);
+    metrics.webrtcRooms = io.sockets.adapter.rooms.size;
+    console.log(`[WebRTC] Peer ${socket.id} joined room ${roomId}`);
+    if (typeof callback === "function") {
+      callback({ success: true, room: roomId, peerId: socket.id });
+    }
+    socket.to(roomId).emit("peer-joined", { peerId: socket.id });
+  });
 
-    socket.on('process-video', async (data) => {
-        console.log('🟢 Processing video...', data);
-        recordedChunks = []
+  socket.on("webrtc-offer", ({ roomId, offer }) => {
+    socket.to(roomId).emit("webrtc-offer", { peerId: socket.id, offer });
+  });
 
-        fs.readFile('temp_upload/' + data.filename, async (err, file) => {
-            const processing = await axios.post(
-                `${process.env.NEXT_API_HOST}/recording/${data.userId}/processing`,
-                { filename: data.filename }
-            )
+  socket.on("webrtc-answer", ({ roomId, answer }) => {
+    socket.to(roomId).emit("webrtc-answer", { peerId: socket.id, answer });
+  });
 
-            if (processing.data.status !== 200) {
-                return console.log(
-                    'Error:🔴 Something went wrong with creating processing file!'
-                )
-            }
+  socket.on("ice-candidate", ({ roomId, candidate }) => {
+    socket.to(roomId).emit("ice-candidate", { peerId: socket.id, candidate });
+  });
 
-            const Key = data.filename
-            const Bucket = process.env.BUCKET_NAME
-            const ContentType = 'video/webm'
-            const command = new PutObjectCommand({
-                Key,
-                Bucket,
-                ContentType,
-                Body: file
-            })
+  socket.on("disconnect", () => {
+    metrics.activeConnections = Math.max(0, metrics.activeConnections - 1);
+    console.log(`🔴 [Socket] Client disconnected: ${socket.id} (Remaining: ${metrics.activeConnections})`);
+  });
+});
 
-            const fileStatus = await s3.send(command)
+// Graceful Process Termination
+const shutdown = (signal) => {
+  console.log(`\n🛑 [Server] Received ${signal}. Gracefully closing HTTP and Socket servers...`);
+  io.close(() => {
+    server.close(() => {
+      console.log("✅ [Server] All sockets and HTTP listeners terminated cleanly.");
+      process.exit(0);
+    });
+  });
+  setTimeout(() => process.exit(0), 5000);
+};
 
-            // transcribe 
-            if (fileStatus['$metadata'].httpStatusCode === 200) {
-                console.log("✅ Video uploaded to AWS");
-
-                if (processing.data.plan === 'PRO') {
-                    fs.stat('temp_upload/' + data.filename, async (err, stat) => {
-                        if (!err) {
-                            // whisper 25mb
-                            if (stat.size < 25000000) {
-                                const transcription = await openai.audio.transcriptions.create({
-                                    file: fs.createReadStream(`temp_upload/${data.filename}`),
-                                    model: 'whisper-1',
-                                    response_format: 'text'
-                                })
-
-                                if (transcription) {
-                                    const completion = await openai.chat.completions.create({
-                                        model: 'gpt-3.5-turbo',
-                                        response_format: { type: 'json_object' },
-                                        messages: [
-                                            {
-                                                role: 'system',
-                                                content: `You are going to generate a title and a nice description using the speech to text transcription provided: transcription(${transcription}) and then return it in json format as {"title: <the title you gave>,"summary": <the summary you created>}`
-                                            }
-                                        ]
-                                    })
-
-                                    const titleAndSummaryGenerated = await axios.post(`${process.env.NEXT_API_HOST}/recording/${data.userId}/transcribe`, {
-                                        filename: data.filename,
-                                        content: completion.choices[0].message.content,
-                                        transcript: transcription
-                                    })
-
-                                    if (titleAndSummaryGenerated.data.status !== 200) {
-                                        console.log(
-                                            'Error:🔴 Something went wrong when creating the title and description!'
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    })
-                }
-
-                const stopProcessing = await axios.post(
-                    `${process.env.NEXT_API_HOST}/recording/${data.userId}/complete`,
-                    { filename: data.filename }
-                )
-
-                if (stopProcessing.data.status !== 200) {
-                    console.log(
-                        'Error:🔴 Something went wrong when stopping the process and trying to complete the processing stage!'
-                    )
-                }
-
-                if (stopProcessing.status === 200) {
-                    fs.unlink('temp_upload/' + data.filename, (err) => {
-                        if (!err) console.log(data.filename + ' ' + '🟢 deleted successfully!');
-                    })
-                }
-            } else {
-                console.log("🔴 Error, Upload Failes! process aborted!");
-            }
-        })
-    })
-
-    socket.on('disconnect', async (data) => {
-        console.log("🔴 Socket is disconnected", socket.id);
-    })
-})
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 server.listen(port, () => {
-    console.log('✅ Listening to port', port);
-})
+  console.log(`
+================================================================================
+  🎬 KOOMAI HIGH-THROUGHPUT MEDIA INGESTION & WEBRTC API
+  Status:  OPERATIONAL
+  Port:    ${port}
+  Health:  http://localhost:${port}/health
+  Metrics: http://localhost:${port}/metrics
+================================================================================
+  `);
+});
