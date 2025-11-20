@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: koom-ai-express
+    runtime: docker
+    plan: free
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 5001
+      - key: NODE_ENV
+        value: production
+      - key: NEXT_API_HOST
+        sync: false
+      - key: NEXT_PUBLIC_URL
+        sync: false
+      - key: AWS_REGION
+        sync: false
+      - key: AWS_ACCESS_KEY_ID
+        sync: false
+      - key: AWS_SECRET_ACCESS_KEY
+        sync: false
+      - key: AWS_BUCKET_NAME
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
